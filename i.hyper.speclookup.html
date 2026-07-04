@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>i.hyper.speclookup - GRASS GIS manual</title>
+<meta charset="utf-8">
+</head>
+<body>
+
+<h2>DESCRIPTION</h2>
+
+<p><em>i.hyper.speclookup</em> is the query-side counterpart to the
+<b>i.hyper.lib_*</b> harvester family (<em>i.hyper.lib_ecosis</em>,
+<em>i.hyper.lib_usgs</em>, <em>i.hyper.lib_relab</em>): it reads the shared
+spectral library those modules build at
+<code>$HOME/grassdata/hyperspeclib</code> and answers two kinds of question
+against it, in one module because they share the same filtering and
+library-reading machinery:</p>
+
+<ol>
+  <li><b>Metadata search</b> &mdash; "what's in the library matching these
+    criteria?" (source, category, free text, wavelength coverage, band
+    count, geographic bounds). No query spectrum needed.</li>
+  <li><b>Spectral similarity matching</b> &mdash; "what in the library
+    looks most like <i>this</i> spectrum?" &mdash; given one or more query
+    spectra (from a vector map or CSV, in the same
+    <code>wl_&lt;wavelength&gt;</code> column convention
+    <em>i.hyper.endmembers</em> writes), ranks every matching library
+    record by Spectral Angle Mapper, Pearson correlation, or Euclidean
+    distance and returns the best <b>top_n</b> per query spectrum.</li>
+</ol>
+
+<p>Both modes work identically regardless of whether the library was built
+with <b>format=parquet</b> or <b>format=sqlite</b>, and regardless of which
+harvester(s) populated it &mdash; <b>format=auto</b> (default) detects
+which backend is present.</p>
+
+<h3>Filtering (applies to both modes)</h3>
+
+<ul>
+  <li><b>source_database=</b>, <b>dataset_id=</b>: restrict to specific
+    harvested sources (<code>ecosis</code>, <code>usgs_splib07</code>,
+    <code>relab</code>, or any future <code>i.hyper.lib_*</code> source)
+    and/or specific dataset groupings (an EcoSIS package ID, a USGS
+    chapter, or a RELAB <code>GeneralType1</code> category).</li>
+  <li><b>search=</b>: case-insensitive substring match against
+    <code>dataset_title</code>, <code>record_id</code>, and the full
+    <code>extra_metadata</code> JSON blob &mdash; so it also matches on
+    fields nested in per-source metadata (e.g. a USGS mineral's
+    <code>mineral_type</code> classification group), not just the primary
+    name.</li>
+  <li><b>min_wavelength=</b>/<b>max_wavelength=</b>: keep only records
+    whose own spectrum's wavelength range covers at least the requested
+    bound (i.e. the record's first wavelength is at or below
+    <b>min_wavelength</b> and its last wavelength is at or above
+    <b>max_wavelength</b>) &mdash; useful for e.g. "must include the SWIR"
+    without caring exactly how many bands.</li>
+  <li><b>min_bands=</b>/<b>max_bands=</b>: restrict by band count.</li>
+  <li><b>n=</b>/<b>s=</b>/<b>e=</b>/<b>w=</b>: geographic bounding box on
+    latitude/longitude (degrees) &mdash; only meaningful for georeferenced
+    records (chiefly EcoSIS field spectra; USGS and RELAB lab samples have
+    no coordinates and are simply excluded by any bbox filter).</li>
+</ul>
+
+<p>All filters combine with AND. Parquet-backed filters (source_database,
+dataset_id, band count, bbox, free text) are pushed down into the scan
+itself (<code>pyarrow.dataset</code> predicate pushdown / SQLite
+<code>WHERE</code>); the wavelength-coverage filter is applied just after,
+per candidate row, since coverage is derived from the
+<code>wavelengths</code> array rather than a plain scalar column.</p>
+
+<h3>Metadata search mode (no query_vector/query_csv given)</h3>
+
+<p>Scans the library with the given filters, printing up to <b>limit</b>
+matches (source/category/record ID/title/band count) and, if
+<b>output=</b> is given, writing the same (lightweight, no spectra by
+default) rows to CSV or JSON. Add <b>-s</b> to include each matched
+record's full <code>wavelengths</code>/<code>values</code> arrays in the
+output file too.</p>
+
+<h3>Spectral similarity matching mode</h3>
+
+<p>Triggered by <b>query_vector=</b> (a GRASS point vector map, e.g.
+<em>i.hyper.endmembers</em>'s vector output) and/or <b>query_csv=</b> (a
+CSV file, e.g. <em>i.hyper.endmembers</em>'s CSV output) &mdash; both read
+<code>wl_&lt;wavelength&gt;</code> attribute/column names (the exact
+naming convention <em>i.hyper.endmembers</em> writes:
+<code>wl_2265_19</code> for 2265.19, <code>wl_neg_5_2</code> for -5.2) and
+treat each row/point as one independent query spectrum.</p>
+
+<p>For every candidate library record (after the filters above), the
+record's own spectrum is linearly interpolated (<code>numpy.interp</code>)
+onto the query spectrum's wavelength grid, restricted to the wavelengths
+actually <b>overlapping</b> the candidate's own native range (no
+extrapolation) &mdash; candidates with fewer than <b>min_overlap_bands</b>
+(default 5) overlapping points are skipped as not comparable. The
+resampled pair is then scored by <b>similarity_method</b>:</p>
+
+<ul>
+  <li><b>sam</b> (default): Spectral Angle Mapper, the angle in degrees
+    between the two spectra as vectors &mdash; 0 is an exact match, lower
+    is more similar. Insensitive to a uniform brightness/albedo scaling
+    difference between query and candidate, which is usually desirable
+    when comparing a real scene pixel against a clean lab/library
+    reference.</li>
+  <li><b>correlation</b>: Pearson correlation coefficient over the
+    overlapping bands &mdash; 1.0 is a perfect match, higher is more
+    similar.</li>
+  <li><b>euclidean</b>: Euclidean distance &mdash; 0 is an exact match,
+    lower is more similar. Sensitive to absolute brightness differences
+    (unlike SAM), so best when query and candidate are already on a
+    comparable scale.</li>
+</ul>
+
+<p>The <b>top_n</b> best-scoring candidates per query spectrum are printed
+and, if <b>output=</b> is given, written to CSV or JSON (one row per
+(query, rank) pair, with <b>-s</b> again controlling whether the matched
+spectra themselves are included).</p>
+
+<h3>Performance</h3>
+
+<p>The whole matching scan streams the library in batches (bounded memory
+regardless of how many candidates match, the same batching discipline the
+harvesters use when writing), so narrowing with
+<b>source_database=</b>/<b>dataset_id=</b> mainly saves <i>time</i>, not
+memory &mdash; matching one query spectrum against all ~2,450 USGS
+splib07a records takes a few seconds; matching against the full
+~266,000-record library (no source/category filter) will scan
+proportionally longer. Filter to the source(s) most likely to contain
+what you're looking for when you can.</p>
+
+<h2>NOTES</h2>
+
+<p><b>query_vector</b> and <b>query_csv</b> can both be given at once
+&mdash; their query spectra are simply concatenated (each still matched
+and ranked independently).</p>
+
+<p>A CSV or vector map's non-<code>wl_*</code> columns (<code>cat</code>,
+<code>x</code>/<code>y</code>, <code>lon</code>/<code>lat</code>) are
+ignored for matching purposes; they exist only to identify each query
+point (used to label its result set) or for downstream reprojection in
+whichever module produced them.</p>
+
+<h2>EXAMPLES</h2>
+
+<h3>Metadata search: free text, restricted to one source</h3>
+
+<div class="code"><pre>
+i.hyper.speclookup search=Kaolinite source_database=usgs_splib07 limit=5
+</pre></div>
+
+<div class="code"><pre>
+Library: /home/yann/grassdata/hyperspeclib (format=parquet)
+Searching library metadata&hellip;
+10 matching record(s) (limit=5).
+[usgs_splib07/ChapterM_Minerals] splib07a_Antigorite_NMNH17958_BECKb_AREF: Minerals (476 bands, nm)
+...
+</pre></div>
+
+<p>Note that <code>search=Kaolinite</code> also matches <i>Antigorite</i>
+here &mdash; USGS's own metadata classifies it under the
+"Kaolinite-Serpentine group" mineral family, and <b>search=</b> matches
+the full <code>extra_metadata</code> text, not just the primary sample
+name. Add <code>dataset_id=ChapterM_Minerals</code> to also restrict by
+chapter, or tighten <b>search=</b> to a more specific phrase if only the
+exact mineral name is wanted.</p>
+
+<h3>Metadata search with geographic + wavelength filters, JSON output</h3>
+
+<div class="code"><pre>
+i.hyper.speclookup source_database=ecosis n=40 s=30 e=-100 w=-125 \
+    min_wavelength=400 max_wavelength=2400 limit=5 \
+    output=matches.json output_format=json
+</pre></div>
+
+<div class="code"><pre>
+Library: /home/yann/grassdata/hyperspeclib (format=parquet)
+Searching library metadata&hellip;
+5 matching record(s) (limit=5).
+[ecosis/0c23c6f5-6fdc-48a7-8977-40354c9f948d] 676479c0cc8e84e775975af7:
+Fresh Leaf Spectra and Measured Traits from the Sierra Nevada (CA) in July 2023 (2151 bands, nm)
+...
+Wrote 5 record(s) &rarr; matches.json
+</pre></div>
+
+<h3>Spectral similarity matching against a query CSV</h3>
+
+<p>Given a query CSV in <em>i.hyper.endmembers</em>'s own wide format
+(first two columns are coordinates, the rest are
+<code>wl_&lt;wavelength&gt;</code> reflectance values &mdash; here built
+from a resampled real USGS Kaolinite spectrum, as a verification case):</p>
+
+<div class="code"><pre>
+i.hyper.speclookup query_csv=query_kaolinite.csv \
+    source_database=usgs_splib07 dataset_id=ChapterM_Minerals top_n=3
+</pre></div>
+
+<div class="code"><pre>
+Library: /home/yann/grassdata/hyperspeclib (format=parquet)
+Matching 1 query spectrum/spectra against the library (method=sam)&hellip;
+Scanned 1276 candidate record(s).
+Top 3 match(es) for 'row1':
+  1. [usgs_splib07/ChapterM_Minerals] splib07a_Kaolinite_CM5_BECKb_AREF (Minerals) -- sam=2e-06 (96 overlapping bands)
+  2. [usgs_splib07/ChapterM_Minerals] splib07a_Kaolinite_CM3_BECKa_AREF (Minerals) -- sam=0.80745 (96 overlapping bands)
+  3. [usgs_splib07/ChapterM_Minerals] splib07a_Kaolinite_GDS11_lt63um_BECKb_AREF (Minerals) -- sam=0.845591 (94 overlapping bands)
+</pre></div>
+
+<p>The query spectrum <i>is</i> (a coarsened resample of)
+<code>Kaolinite_CM5</code>'s own real spectrum, and it correctly comes
+back as the top match at <code>sam=2e-06</code> degrees
+(floating-point-level agreement) &mdash; with the next two matches being
+other real Kaolinite specimens in the library, confirming both the
+resampling/overlap logic and that SAM correctly favors genuinely similar
+mineralogy over unrelated samples.</p>
+
+<h3>Same query, against a vector map instead, with full-spectra CSV output</h3>
+
+<div class="code"><pre>
+v.in.ascii input=query_kaolinite.txt output=query_pts \
+    columns="x double precision, y double precision, wl_221_1 double precision, ..." \
+    separator=pipe x=1 y=2
+i.hyper.speclookup query_vector=query_pts source_database=usgs_splib07 \
+    dataset_id=ChapterM_Minerals top_n=3 output=matches.csv -s
+</pre></div>
+
+<div class="code"><pre>
+Matching 1 query spectrum/spectra against the library (method=sam)&hellip;
+Scanned 1276 candidate record(s).
+Top 3 match(es) for 'cat1':
+  1. [usgs_splib07/ChapterM_Minerals] splib07a_Kaolinite_CM5_BECKb_AREF (Minerals) -- sam=2e-06 (96 overlapping bands)
+  ...
+Wrote 3 match(es) &rarr; matches.csv
+</pre></div>
+
+<p><code>matches.csv</code> includes each match's rank, similarity score,
+full <code>extra_metadata</code> (mineral name, formula, locality, ...),
+and &mdash; because of <b>-s</b> &mdash; the matched record's own
+<code>wavelengths</code>/<code>values</code> arrays, ready for direct
+overplotting against the query spectrum.</p>
+
+<h3>Comparing the similarity methods on the same query</h3>
+
+<div class="code"><pre>
+i.hyper.speclookup query_csv=query_kaolinite.csv source_database=usgs_splib07 \
+    dataset_id=ChapterM_Minerals top_n=1 similarity_method=correlation
+i.hyper.speclookup query_csv=query_kaolinite.csv source_database=usgs_splib07 \
+    dataset_id=ChapterM_Minerals top_n=1 similarity_method=euclidean
+</pre></div>
+
+<div class="code"><pre>
+1. ... splib07a_Kaolinite_CM5_BECKb_AREF (Minerals) -- correlation=1.0 (96 overlapping bands)
+1. ... splib07a_Kaolinite_CM5_BECKb_AREF (Minerals) -- euclidean=0.0 (96 overlapping bands)
+</pre></div>
+
+<p>All three metrics agree on the exact match, as expected; they differ in
+how sharply they penalize partial mismatches among the runners-up (SAM and
+correlation are shape-sensitive and albedo-tolerant, Euclidean is
+not).</p>
+
+<h2>SEE ALSO</h2>
+
+<em>
+<a href="i.hyper.lib_ecosis.html">i.hyper.lib_ecosis</a>,
+<a href="i.hyper.lib_usgs.html">i.hyper.lib_usgs</a>,
+<a href="i.hyper.lib_relab.html">i.hyper.lib_relab</a>,
+<a href="i.hyper.endmembers.html">i.hyper.endmembers</a>,
+<a href="i.hyper.spectroscopy.html">i.hyper.spectroscopy</a>
+</em>
+
+<h2>AUTHOR</h2>
+
+Spectral Feature Extraction and Interpretation Engine
+
+</body>
+</html>
