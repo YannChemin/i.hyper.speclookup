@@ -159,7 +159,16 @@
 # % type: integer
 # % required: no
 # % answer: 5
-# % description: Minimum number of overlapping bands required to score a candidate against the query spectrum
+# % description: Minimum number of overlapping bands required to score a candidate against the query spectrum (absolute floor)
+# % guisection: Query
+# %end
+
+# %option
+# % key: min_overlap_fraction
+# % type: double
+# % required: no
+# % answer: 0.0
+# % description: Minimum overlapping bands required, as a fraction (0-1) of the query spectrum's own band count -- both this and min_overlap_bands must be satisfied. An absolute floor alone does not scale: e.g. 13 overlapping bands is a weak, edge-of-range match for a 255-band hyperspectral query but would be unremarkable for a 20-band multispectral one. Default 0 (disabled) preserves the absolute-only behavior
 # % guisection: Query
 # %end
 
@@ -442,7 +451,8 @@ def load_query_spectra_from_vector(map_name: str) -> list[tuple[str, list[float]
 # ---------------------------------------------------------------------------
 
 
-def _resample_overlap(query_wl, query_val, cand_wl, cand_val, min_overlap_bands):
+def _resample_overlap(query_wl, query_val, cand_wl, cand_val, min_overlap_bands,
+                      min_overlap_fraction=0.0):
     """A handful of harvested records carry a literal "NaN"/"Inf" string in
     a datapoint that Python's float() parses without raising (unlike a
     genuinely unparseable value), so it isn't caught by the harvesters'
@@ -462,8 +472,10 @@ def _resample_overlap(query_wl, query_val, cand_wl, cand_val, min_overlap_bands)
     if cand_wl.size < 2:
         return None
     lo, hi = cand_wl[0], cand_wl[-1]
-    mask = (np.asarray(query_wl) >= lo) & (np.asarray(query_wl) <= hi)
-    if mask.sum() < min_overlap_bands:
+    query_wl = np.asarray(query_wl)
+    mask = (query_wl >= lo) & (query_wl <= hi)
+    required = max(min_overlap_bands, int(np.ceil(min_overlap_fraction * query_wl.size)))
+    if mask.sum() < required:
         return None
     qwl = np.asarray(query_wl)[mask]
     qval = np.asarray(query_val)[mask]
@@ -538,6 +550,7 @@ def main(options, flags):
     query_csv = options.get("query_csv")
     similarity_method = options.get("similarity_method", "sam") or "sam"
     min_overlap_bands = int(options.get("min_overlap_bands", "5") or "5")
+    min_overlap_fraction = float(options.get("min_overlap_fraction", "0.0") or "0.0")
     top_n = int(options.get("top_n", "10") or "10")
 
     output = options.get("output")
@@ -608,7 +621,8 @@ def main(options, flags):
         if max_wavelength is not None and (cand_wl[-1] < max_wavelength):
             continue
         for label, qwl, qval in queries:
-            resampled = _resample_overlap(qwl, qval, cand_wl, cand_val, min_overlap_bands)
+            resampled = _resample_overlap(qwl, qval, cand_wl, cand_val, min_overlap_bands,
+                                          min_overlap_fraction)
             if resampled is None:
                 continue
             qv, cv = resampled

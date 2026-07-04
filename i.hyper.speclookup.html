@@ -91,9 +91,18 @@ treat each row/point as one independent query spectrum.</p>
 record's own spectrum is linearly interpolated (<code>numpy.interp</code>)
 onto the query spectrum's wavelength grid, restricted to the wavelengths
 actually <b>overlapping</b> the candidate's own native range (no
-extrapolation) &mdash; candidates with fewer than <b>min_overlap_bands</b>
-(default 5) overlapping points are skipped as not comparable. The
-resampled pair is then scored by <b>similarity_method</b>:</p>
+extrapolation) &mdash; candidates with fewer overlapping points than
+<i>either</i> <b>min_overlap_bands</b> (default 5, an absolute floor) or
+<b>min_overlap_fraction</b> (default 0, disabled) are skipped as not
+comparable. An absolute floor alone does not scale: 13 overlapping bands
+is a weak, edge-of-range match for a 255-band hyperspectral query (e.g.
+some USGS NIC4/Nicolet mineral records are only measured from ~2400nm
+onward, overlapping a typical VNIR/SWIR scene in just a narrow sliver at
+its very end) but would be unremarkable for a 20-band multispectral one
+&mdash; <b>min_overlap_fraction</b> expresses the requirement relative to
+the query's own band count instead (e.g. 0.15 = at least 15% of the
+query's bands must be covered), and both thresholds apply together when
+set. The resampled pair is then scored by <b>similarity_method</b>:</p>
 
 <ul>
   <li><b>sam</b> (default): Spectral Angle Mapper, the angle in degrees

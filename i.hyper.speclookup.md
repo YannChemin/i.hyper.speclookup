@@ -17,7 +17,7 @@ similarity to a query spectrum.
 [**n**=*value*] [**s**=*value*] [**e**=*value*] [**w**=*value*]
 [**query_vector**=*name*] [**query_csv**=*string*]
 [**similarity_method**=*string*] [**min_overlap_bands**=*value*]
-[**top_n**=*value*] [**limit**=*value*]
+[**min_overlap_fraction**=*value*] [**top_n**=*value*] [**limit**=*value*]
 [**output**=*string*] [**output_format**=*string*] [**-s**]
 
 ## DESCRIPTION
@@ -93,8 +93,17 @@ For every candidate library record (after the filters above), the
 record's own spectrum is linearly interpolated (`numpy.interp`) onto the
 query spectrum's wavelength grid, restricted to the wavelengths actually
 **overlapping** the candidate's own native range (no extrapolation) --
-candidates with fewer than **min_overlap_bands** (default 5) overlapping
-points are skipped as not comparable. The resampled pair is then scored by
+candidates with fewer overlapping points than *either* **min_overlap_bands**
+(default 5, an absolute floor) or **min_overlap_fraction** (default 0,
+disabled) are skipped as not comparable. An absolute floor alone does not
+scale: 13 overlapping bands is a weak, edge-of-range match for a
+255-band hyperspectral query (e.g. some USGS NIC4/Nicolet mineral records
+are only measured from ~2400nm onward, overlapping a typical VNIR/SWIR
+scene in just a narrow sliver at its very end) but would be unremarkable
+for a 20-band multispectral one -- **min_overlap_fraction** expresses the
+requirement relative to the query's own band count instead (e.g. 0.15 =
+at least 15% of the query's bands must be covered), and both thresholds
+apply together when set. The resampled pair is then scored by
 **similarity_method**:
 
 - **sam** (default): Spectral Angle Mapper, the angle in degrees between
