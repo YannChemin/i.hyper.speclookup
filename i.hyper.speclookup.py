@@ -176,7 +176,7 @@
 # % type: integer
 # % required: no
 # % answer: 5
-# % description: Minimum number of overlapping bands required to score a candidate against the query spectrum (absolute floor)
+# % description: Minimum number of overlapping bands required to score a candidate against the query spectrum (absolute floor). With server=, it counts canonical grid points instead of the query's own bands, and it is the threshold that holds whatever the query's gaps do to min_overlap_fraction's denominator
 # % guisection: Query
 # %end
 
@@ -185,7 +185,7 @@
 # % type: double
 # % required: no
 # % answer: 0.0
-# % description: Minimum overlapping bands required, as a fraction (0-1) of the query spectrum's own band count -- both this and min_overlap_bands must be satisfied. An absolute floor alone does not scale: e.g. 13 overlapping bands is a weak, edge-of-range match for a 255-band hyperspectral query but would be unremarkable for a 20-band multispectral one. Default 0 (disabled) preserves the absolute-only behavior. With server=, the fraction is applied to the number of grid points the query covers rather than to its own band count: a 408-band cube covering 203 of the index's 216 grid points needs 112 overlapping points at 0.55
+# % description: Minimum overlapping bands required, as a fraction (0-1) of the query spectrum's own band count -- both this and min_overlap_bands must be satisfied. An absolute floor alone does not scale: e.g. 13 overlapping bands is a weak, edge-of-range match for a 255-band hyperspectral query but would be unremarkable for a 20-band multispectral one. Default 0 (disabled) preserves the absolute-only behavior. With server=, the fraction is applied to the number of grid points the query covers after resampling, not to its own band count: a 408-band cube covering 203 of the index's 216 grid points needs 112 overlapping points at 0.55, but the same cube with the two water-vapour windows missing covers only 167 points and so needs 92 -- set min_overlap_bands= to hold an absolute floor across queries that differ in coverage
 # % guisection: Query
 # %end
 
@@ -572,18 +572,18 @@ def _search_server(server: str, queries, *, metric: str, top_n: int,
     url = server.rstrip("/") + "/search"
     rows = []
     for label, qwl, qval in queries:
-        # The server takes a single overlap threshold as a fraction, so the
-        # absolute floor is converted into those terms and the stricter of
-        # the two wins. Note the denominator differs from the local path's:
-        # the server applies the fraction to the number of grid points the
-        # query covers after resampling, not to its own band count, which
-        # is the only reading that can be satisfied at all (55% of a
-        # 408-band cube would exceed the whole 216-point grid).
-        floor = (min_overlap_bands / float(len(qwl))) if qwl else 0.0
+        # Both thresholds go to the server as they are, and it applies the
+        # stricter. The absolute one cannot be folded into the fraction
+        # here: the server measures the fraction against the number of grid
+        # points the query covers after resampling, which this module does
+        # not know before asking, and which shrinks when the query has
+        # spectral gaps -- converting the floor against the query's own band
+        # count would quietly ask for fewer bands than it says.
         payload = {
             "wavelengths": list(qwl), "values": list(qval),
             "k": top_n, "metric": metric,
-            "min_overlap": min(max(min_overlap_fraction, floor), 1.0),
+            "min_overlap": min(max(min_overlap_fraction, 0.0), 1.0),
+            "min_overlap_bands": int(min_overlap_bands),
         }
         if sources:
             payload["source"] = list(sources)
@@ -730,6 +730,21 @@ def main(options, flags):
                 "The server returns identities and scores but not the matched "
                 "records' own spectra, so the -s flag is ignored. Read them "
                 "from the library the index was built from if they are needed."
+            )
+        if min_overlap_bands and not info.get("absolute_overlap_floor"):
+            # An older server takes the fraction only, and would drop the
+            # absolute floor without saying so. Say so here instead: the
+            # fraction's denominator is the grid points the query covers,
+            # which shrinks where the query has spectral gaps, so the
+            # threshold that is left is the looser one exactly where the
+            # floor was wanted.
+            gs.warning(
+                "This server does not apply min_overlap_bands={} (it predates "
+                "the absolute overlap floor), so only "
+                "min_overlap_fraction={} is enforced, against the number of "
+                "grid points each query covers. Update the server, or raise "
+                "min_overlap_fraction=, to hold a floor in bands.".format(
+                    min_overlap_bands, min_overlap_fraction)
             )
         gs.message(
             f"Matching {len(queries)} query spectrum/spectra against the served "

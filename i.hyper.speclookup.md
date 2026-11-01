@@ -158,15 +158,24 @@ What changes in this mode:
   **max_wavelength=**, **min_bands=**, **max_bands=**, **n/s/e/w=**) are
   not carried by the index and are refused rather than ignored.
   **source_database=** and **category=** are applied server-side.
-- **min_overlap_bands=** and **min_overlap_fraction=** both still apply,
-  but the fraction is measured against a different denominator than it is
-  locally. The absolute floor is converted into a fraction and the stricter
-  of the two is sent; the server then applies it to the number of *grid
-  points the query covers*, not to the query's own band count. A 408-band
-  cube spanning 411-2450 nm covers 203 of the index's 216 grid points, so
-  **min_overlap_fraction=0.55** requires 112 overlapping points, not 225.
-  This is the only reading that works: 55% of 408 would demand more points
-  than the grid has and reject every candidate.
+- **min_overlap_bands=** and **min_overlap_fraction=** are both sent as
+  they are, and the server applies the stricter of the two. The fraction is
+  measured against a different denominator than it is locally: the number
+  of *grid points the query covers*, not the query's own band count. A
+  408-band cube spanning 411-2450 nm covers 203 of the index's 216 grid
+  points, so **min_overlap_fraction=0.55** requires 112 overlapping points,
+  not 225. This is the only reading that works: 55% of 408 would demand
+  more points than the grid has and reject every candidate.
+- That denominator is also why **min_overlap_bands=** matters here. The
+  server treats a spectral gap as no support rather than interpolating a
+  straight line across it, so a query with gaps covers fewer grid points
+  and the same fraction asks for fewer bands: the C2RD cube above covers
+  203 points when its two water-vapour windows are bridged but only 167
+  when they are honoured, and
+  **min_overlap_fraction=0.55** falls from a 112-point requirement to a
+  92-point one -- measured, and it changed 7 of 20 top-1 identifications.
+  **min_overlap_bands=112** holds the same requirement whatever the query's
+  coverage, which is what an absolute floor is for.
 - **-s** is ignored, with a warning: the index carries each record's
   identity and category but not its own spectrum. Read those from the
   library the index was built from if they are needed.
