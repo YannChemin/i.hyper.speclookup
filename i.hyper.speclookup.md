@@ -9,8 +9,9 @@ similarity to a query spectrum.
 ## SYNOPSIS
 
 **i.hyper.speclookup**
-[**library**=*string*] [**format**=*string*]
+[**library**=*string*] [**format**=*string*] [**server**=*string*]
 [**source_database**=*string*[,*string*,...]]
+[**category**=*string*[,*string*,...]]
 [**dataset_id**=*string*[,*string*,...]] [**search**=*string*]
 [**min_wavelength**=*value*] [**max_wavelength**=*value*]
 [**min_bands**=*value*] [**max_bands**=*value*]
@@ -44,12 +45,23 @@ with `format=parquet` or `format=sqlite`, and regardless of which
 harvester(s) populated it -- **format=auto** (default) detects which
 backend is present.
 
+Similarity matching can also be answered by an index **server=** instead
+of a local library tree, which is what makes matching against a
+quarter-million-record library practical (see *Server mode* below).
+
 ### Filtering (applies to both modes)
 
 - **source_database=**, **dataset_id=**: restrict to specific harvested
   sources (`ecosis`, `usgs_splib07`, `relab`, or any future
   `i.hyper.lib_*` source) and/or specific dataset groupings (an EcoSIS
   package ID, a USGS chapter, or a RELAB `GeneralType1` category).
+- **category=**: restrict to specific material categories (`mineral`,
+  `soil`, `rock`, `vegetation`, `water`, `snow_ice`, `man_made`,
+  `organic_compound`, `mixture`, `other`). This needs **server=**: only
+  the served index carries one normalised category per record, where a
+  local tree carries each source's own, differently-spelled grouping in
+  **dataset_id=**. Asking for it without **server=** is an error rather
+  than a silently ignored filter.
 - **search=**: case-insensitive substring match against `dataset_title`,
   `record_id`, and the full `extra_metadata` JSON blob -- so it also
   matches on fields nested in per-source metadata (e.g. a USGS mineral's
@@ -122,6 +134,49 @@ if **output=** is given, written to CSV or JSON (one row per (query, rank)
 pair, with **-s** again controlling whether the matched spectra themselves
 are included).
 
+### Server mode
+
+**server=** takes the base URL of a spectral index server (e.g.
+`http://127.0.0.1:8977`) and sends it each query spectrum, instead of
+reading and scoring library records locally. The server keeps the whole
+library resident as one L2-normalised float32 matrix and answers an
+*exact* nearest-neighbour search -- not an approximate index -- so a query
+costs tens of milliseconds whatever the library holds, where a local scan
+pays an interpolation per candidate record.
+
+What changes in this mode:
+
+- Only similarity matching is served. A metadata-only search (no
+  **query_vector**/**query_csv**) needs a local **library=** tree.
+- **similarity_method=** must be one the server computes: `sam`, `cosine`,
+  `cr_sam` (continuum-removed SAM) or `gd1` (first-derivative SAM).
+  `correlation` and `euclidean` are local-only. Every served metric is
+  reported as an angle in **degrees**, lower meaning more similar, so a
+  `sam` score means exactly what it does locally.
+- The per-record metadata filters a local tree supports
+  (**dataset_id=**, **search=**, **min_wavelength=**,
+  **max_wavelength=**, **min_bands=**, **max_bands=**, **n/s/e/w=**) are
+  not carried by the index and are refused rather than ignored.
+  **source_database=** and **category=** are applied server-side.
+- **min_overlap_bands=** and **min_overlap_fraction=** both still apply,
+  but the fraction is measured against a different denominator than it is
+  locally. The absolute floor is converted into a fraction and the stricter
+  of the two is sent; the server then applies it to the number of *grid
+  points the query covers*, not to the query's own band count. A 408-band
+  cube spanning 411-2450 nm covers 203 of the index's 216 grid points, so
+  **min_overlap_fraction=0.55** requires 112 overlapping points, not 225.
+  This is the only reading that works: 55% of 408 would demand more points
+  than the grid has and reject every candidate.
+- **-s** is ignored, with a warning: the index carries each record's
+  identity and category but not its own spectrum. Read those from the
+  library the index was built from if they are needed.
+
+Results carry the same column names as the local backend's, so anything
+reading this module's CSV/JSON (notably *i.hyper.endmembers* **-i**) works
+unchanged against either. `record_id` is the served library's own spectrum
+id and `dataset_title` its material name; `organization` and `n_bands`
+come back empty, as the index does not carry them.
+
 ### Performance
 
 The whole matching scan streams the library in batches (bounded memory
@@ -132,6 +187,15 @@ spectrum against all ~2,450 USGS splib07a records takes a few seconds;
 matching against the full ~266,000-record library (no source/category
 filter) will scan proportionally longer. Filter to the source(s) most
 likely to contain what you're looking for when you can.
+
+With **server=** that trade-off disappears: the search is a few whole-matrix
+products against a memory-mapped library, so the cost is set by the library's
+size rather than by how much of it the filters let through, and a filter saves
+nothing measurable. Measured against a 251,753-spectrum index on a 216-band
+350-2500 nm grid, one query takes about 47 ms. On a real run, identifying all
+20 endmembers of a 408-band drone cube cost about 5 s together with the
+N-FINDR extraction that produced them, against the minutes a local scan of
+the same library would need.
 
 ## NOTES
 
@@ -237,6 +301,27 @@ Wrote 3 match(es) → matches.csv
 `extra_metadata` (mineral name, formula, locality, ...), and -- because
 of **-s** -- the matched record's own `wavelengths`/`values` arrays, ready
 for direct overplotting against the query spectrum.
+
+### Spectral similarity matching against an index server
+
+Identify one spectrum against a whole served library, restricted to
+minerals, using continuum-removed SAM:
+
+```sh
+i.hyper.speclookup server=http://127.0.0.1:8977 \
+    query_csv=endmembers.csv category=mineral \
+    similarity_method=cr_sam top_n=5 \
+    output=endmember_minerals.csv
+```
+
+Restricting the same query to one source, and keeping the
+reference-grade USGS library only:
+
+```sh
+i.hyper.speclookup server=http://127.0.0.1:8977 \
+    query_csv=endmembers.csv source_database=usgs_splib07 \
+    min_overlap_fraction=0.6 top_n=10
+```
 
 ### Comparing the similarity methods on the same query
 

@@ -29,6 +29,14 @@
 # %end
 
 # %option
+# % key: server
+# % type: string
+# % required: no
+# % description: Base URL of a spectral index server to query instead of scanning library= (e.g. http://127.0.0.1:8977). The server holds the library as one normalised matrix and answers an exact nearest-neighbour search in tens of milliseconds whatever its size; it serves spectral similarity only, not metadata-only searches
+# % guisection: Library
+# %end
+
+# %option
 # % key: format
 # % type: string
 # % required: no
@@ -44,6 +52,15 @@
 # % required: no
 # % multiple: yes
 # % description: Restrict to specific harvested sources (e.g. ecosis,usgs_splib07,relab; default: all)
+# % guisection: Filter
+# %end
+
+# %option
+# % key: category
+# % type: string
+# % required: no
+# % multiple: yes
+# % description: Restrict to specific material categories (e.g. mineral,soil,vegetation,rock,water,snow_ice,man_made,organic_compound,mixture,other; default: all). Requires server=, as only the served index carries a normalised category per record
 # % guisection: Filter
 # %end
 
@@ -148,9 +165,9 @@
 # % key: similarity_method
 # % type: string
 # % required: no
-# % options: sam,correlation,euclidean
+# % options: sam,correlation,euclidean,cosine,cr_sam,gd1
 # % answer: sam
-# % description: Spectral similarity metric. sam: Spectral Angle Mapper (degrees, lower=more similar). correlation: Pearson correlation over the overlapping bands (higher=more similar). euclidean: Euclidean distance (lower=more similar)
+# % description: Spectral similarity metric. sam: Spectral Angle Mapper (degrees, lower=more similar). correlation: Pearson correlation over the overlapping bands (higher=more similar). euclidean: Euclidean distance (lower=more similar). cosine, cr_sam (continuum-removed SAM) and gd1 (first-derivative SAM) are computed by the index server only and need server=; they are reported as an angle in degrees, lower=more similar
 # % guisection: Query
 # %end
 
@@ -168,7 +185,7 @@
 # % type: double
 # % required: no
 # % answer: 0.0
-# % description: Minimum overlapping bands required, as a fraction (0-1) of the query spectrum's own band count -- both this and min_overlap_bands must be satisfied. An absolute floor alone does not scale: e.g. 13 overlapping bands is a weak, edge-of-range match for a 255-band hyperspectral query but would be unremarkable for a 20-band multispectral one. Default 0 (disabled) preserves the absolute-only behavior
+# % description: Minimum overlapping bands required, as a fraction (0-1) of the query spectrum's own band count -- both this and min_overlap_bands must be satisfied. An absolute floor alone does not scale: e.g. 13 overlapping bands is a weak, edge-of-range match for a 255-band hyperspectral query but would be unremarkable for a 20-band multispectral one. Default 0 (disabled) preserves the absolute-only behavior. With server=, the fraction is applied to the number of grid points the query covers rather than to its own band count: a 408-band cube covering 203 of the index's 216 grid points needs 112 overlapping points at 0.55
 # % guisection: Query
 # %end
 
@@ -223,6 +240,8 @@ import sys
 import json
 import math
 import sqlite3
+import urllib.error
+import urllib.request
 from typing import Optional
 
 import grass.script as gs
@@ -506,7 +525,107 @@ def _score(method, qval, cval):
     return None
 
 
-_LOWER_IS_BETTER = {"sam": True, "correlation": False, "euclidean": True}
+# The server reports every metric as an angle (see _search_server), so all of
+# its metrics are lower-is-better, including the ones derived from a cosine.
+_LOWER_IS_BETTER = {"sam": True, "correlation": False, "euclidean": True,
+                    "cosine": True, "cr_sam": True, "gd1": True}
+
+# ---------------------------------------------------------------------------
+# Server backend (an indexed library behind HTTP, queried instead of scanned)
+# ---------------------------------------------------------------------------
+
+_SERVER_METRICS = ("sam", "cosine", "cr_sam", "gd1")
+
+
+def _server_health(server: str) -> dict:
+    """Ask the server what it is serving, before sending it any query.
+
+    A stopped or mistyped server is by far the likeliest mistake here, so it
+    is worth one cheap request to report it with its address and a fix,
+    rather than letting a bare connection error surface from the middle of a
+    query loop."""
+    url = server.rstrip("/") + "/health"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return json.load(response)
+    except (OSError, ValueError) as exc:
+        gs.fatal(
+            f"No spectral index server answering at {server} ({exc}). Start "
+            "one with 'python3 $HOME/dev/specserve/server.py "
+            "--index <index-dir>', or drop server= to scan a local library= "
+            "tree instead."
+        )
+
+
+def _search_server(server: str, queries, *, metric: str, top_n: int,
+                   min_overlap_bands: int, min_overlap_fraction: float,
+                   sources, categories) -> list[dict]:
+    """Rank every query spectrum against the server's index, returning rows
+    in the same shape as the local backend's.
+
+    The server keeps the whole library resident as one normalised matrix and
+    answers with an exact full scan, so a query costs tens of milliseconds
+    whatever the library holds, where the local backend pays an
+    interpolation per candidate record. Every metric comes back as an angle,
+    reported here in degrees so a score means the same thing as the local
+    sam score does."""
+    url = server.rstrip("/") + "/search"
+    rows = []
+    for label, qwl, qval in queries:
+        # The server takes a single overlap threshold as a fraction, so the
+        # absolute floor is converted into those terms and the stricter of
+        # the two wins. Note the denominator differs from the local path's:
+        # the server applies the fraction to the number of grid points the
+        # query covers after resampling, not to its own band count, which
+        # is the only reading that can be satisfied at all (55% of a
+        # 408-band cube would exceed the whole 216-point grid).
+        floor = (min_overlap_bands / float(len(qwl))) if qwl else 0.0
+        payload = {
+            "wavelengths": list(qwl), "values": list(qval),
+            "k": top_n, "metric": metric,
+            "min_overlap": min(max(min_overlap_fraction, floor), 1.0),
+        }
+        if sources:
+            payload["source"] = list(sources)
+        if categories:
+            payload["category"] = list(categories)
+        request = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                answer = json.load(response)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace").strip()
+            gs.fatal(f"The server rejected the query for <{label}>: {detail}")
+        except (OSError, ValueError) as exc:
+            gs.fatal(f"Querying {url} for <{label}> failed: {exc}")
+        for rank, hit in enumerate(answer.get("results", []), start=1):
+            rows.append({
+                "query": label,
+                "rank": rank,
+                "source_database": hit.get("source"),
+                "dataset_id": hit.get("subcategory") or hit.get("category"),
+                "dataset_title": hit.get("name"),
+                "record_id": hit.get("id"),
+                # The index carries neither of these; the local backend reads
+                # them from the records themselves.
+                "organization": "",
+                "n_bands": "",
+                "n_overlap_bands": hit.get("overlap_bands"),
+                "similarity_method": metric,
+                "score": round(math.degrees(hit["angle_rad"]), 6),
+                "extra_metadata": json.dumps({
+                    "category": hit.get("category"),
+                    "subcategory": hit.get("subcategory"),
+                    "formula": hit.get("formula"),
+                    "spectrum_type": hit.get("spectrum_type"),
+                    "native_range_nm": hit.get("native_range_nm"),
+                    "cosine": hit.get("cosine"),
+                    "query_bands": hit.get("query_bands"),
+                }),
+            })
+    return rows
 
 # ---------------------------------------------------------------------------
 # Output
@@ -533,10 +652,13 @@ def _write_output(path: str, fmt: str, rows: list[dict]):
 
 
 def main(options, flags):
+    server = options.get("server") or None
     library_root = options.get("library") or DEFAULT_LIBRARY_ROOT
-    fmt = detect_format(library_root, options.get("format", "auto") or "auto")
+    fmt = None if server else detect_format(
+        library_root, options.get("format", "auto") or "auto")
 
     source_databases = [s for s in (options.get("source_database", "") or "").split(",") if s] or None
+    categories = [s for s in (options.get("category", "") or "").split(",") if s] or None
     dataset_ids = [s for s in (options.get("dataset_id", "") or "").split(",") if s] or None
     search_text = options.get("search") or None
     min_bands = int(options["min_bands"]) if options.get("min_bands") else None
@@ -557,13 +679,82 @@ def main(options, flags):
     output_format = options.get("output_format", "csv") or "csv"
     include_spectra = flags["s"]
 
-    gs.message(f"Library: {library_root} (format={fmt})")
+    if categories and not server:
+        gs.fatal(
+            "category= filters the served index and so needs server=. A local "
+            "library= tree carries source_database= and dataset_id= instead."
+        )
+
+    if server:
+        info = _server_health(server)
+        gs.message(
+            f"Library: {server} ({info.get('n_spectra', '?')} spectra from "
+            f"{info.get('library', 'an unnamed library')})"
+        )
+    else:
+        gs.message(f"Library: {library_root} (format={fmt})")
 
     queries = []
     if query_vector:
         queries.extend(load_query_spectra_from_vector(query_vector))
     if query_csv:
         queries.extend(load_query_spectra_from_csv(query_csv))
+
+    if server:
+        # The index carries a spectrum, its identity and its category -- not
+        # the per-record metadata the local backend filters on.
+        unsupported = [name for name in (
+            "dataset_id", "search", "min_wavelength", "max_wavelength",
+            "min_bands", "max_bands", "n", "s", "e", "w") if options.get(name)]
+        if unsupported:
+            gs.fatal(
+                "server= cannot apply these filters, which the index does not "
+                f"carry: {', '.join(unsupported)}. Drop them, or drop server= "
+                "to scan a local library= tree, which supports all of them."
+            )
+        if not queries:
+            gs.fatal(
+                "server= answers spectral similarity queries only, so it needs "
+                "query_vector= or query_csv=. A metadata-only search has to "
+                "read a local library= tree."
+            )
+        if similarity_method not in _SERVER_METRICS:
+            gs.fatal(
+                f"The server does not compute "
+                f"similarity_method={similarity_method}; it offers "
+                f"{', '.join(_SERVER_METRICS)}. Drop server= to use it "
+                "against a local library= tree."
+            )
+        if include_spectra:
+            gs.warning(
+                "The server returns identities and scores but not the matched "
+                "records' own spectra, so the -s flag is ignored. Read them "
+                "from the library the index was built from if they are needed."
+            )
+        gs.message(
+            f"Matching {len(queries)} query spectrum/spectra against the served "
+            f"index (method={similarity_method})…"
+        )
+        all_rows = _search_server(
+            server, queries, metric=similarity_method, top_n=top_n,
+            min_overlap_bands=min_overlap_bands,
+            min_overlap_fraction=min_overlap_fraction,
+            sources=source_databases, categories=categories,
+        )
+        for label, _, _ in queries:
+            ranked = [r for r in all_rows if r["query"] == label]
+            gs.message(f"Top {len(ranked)} match(es) for '{label}':")
+            for r in ranked:
+                gs.message(
+                    f"  {r['rank']}. [{r['source_database']}/{r['dataset_id']}] "
+                    f"{r['record_id']} ({r['dataset_title']}) -- "
+                    f"{similarity_method}={r['score']} deg "
+                    f"({r['n_overlap_bands']} overlapping bands)"
+                )
+        if output:
+            _write_output(output, output_format, all_rows)
+            gs.message(f"Wrote {len(all_rows)} match(es) → {output}")
+        return
 
     common_kwargs = dict(
         source_databases=source_databases, dataset_ids=dataset_ids,
